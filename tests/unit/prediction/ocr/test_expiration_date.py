@@ -1,6 +1,7 @@
 import datetime
 
 import pytest
+from pytest_mock import MockerFixture
 
 from robotoff.prediction.ocr.expiration_date import (
     MAX_YEARS_IN_FUTURE,
@@ -58,3 +59,102 @@ def test_find_expiration_date_drops_implausible_years():
     # A year far in the past is OCR noise and must be discarded.
     old_year = datetime.date.today().year - (MAX_YEARS_IN_PAST + 10)
     assert find_expiration_date(f"lot 14.06.{old_year}") == []
+
+
+@pytest.fixture
+def fixed_today(mocker: MockerFixture) -> datetime.date:
+    # Freeze only the predictor's clock; keep real calendar-date parsing.
+    clock = mocker.patch(
+        "robotoff.prediction.ocr.expiration_date.datetime", wraps=datetime
+    )
+    clock.date.today.return_value = TODAY
+    return TODAY
+
+
+@pytest.mark.usefixtures("fixed_today")
+@pytest.mark.parametrize("separator", ["-", ".", "/"])
+@pytest.mark.parametrize(
+    "year,matcher_type",
+    [("26", "full_digits_short"), ("2026", "full_digits_long")],
+)
+def test_find_expiration_date_supported_formats(
+    separator: str, year: str, matcher_type: str
+) -> None:
+    raw = separator.join(("14", "06", year))
+    predictions = find_expiration_date(f"Best before {raw}")
+
+    assert len(predictions) == 1
+    prediction = predictions[0]
+    assert prediction.type == PredictionType.expiration_date
+    assert prediction.value == "2026-06-14"
+    assert prediction.data == {"raw": raw, "type": matcher_type}
+    assert prediction.automatic_processing is True
+    assert prediction.predictor == "regex"
+
+
+@pytest.mark.parametrize("year_format", ["%y", "%Y"])
+@pytest.mark.parametrize(
+    "year_offset,month,day,expected",
+    [
+        (-MAX_YEARS_IN_PAST, 1, 1, True),
+        (-MAX_YEARS_IN_PAST, 12, 31, True),
+        (MAX_YEARS_IN_FUTURE, 1, 1, True),
+        (MAX_YEARS_IN_FUTURE, 12, 31, True),
+        (-MAX_YEARS_IN_PAST - 1, 12, 31, False),
+        (MAX_YEARS_IN_FUTURE + 1, 1, 1, False),
+    ],
+)
+def test_find_expiration_date_window_boundaries(
+    fixed_today: datetime.date,
+    year_format: str,
+    year_offset: int,
+    month: int,
+    day: int,
+    expected: bool,
+) -> None:
+    candidate = datetime.date(fixed_today.year + year_offset, month, day)
+    raw = candidate.strftime(f"%d/%m/{year_format}")
+    predictions = find_expiration_date(f"Best before {raw}")
+
+    assert [prediction.value for prediction in predictions] == (
+        [candidate.isoformat()] if expected else []
+    )
+
+
+@pytest.mark.usefixtures("fixed_today")
+@pytest.mark.parametrize("year", ["26", "2026"])
+@pytest.mark.parametrize("day_month", ["31/04", "00/01", "01/13", "29/02"])
+def test_find_expiration_date_rejects_invalid_calendar_dates(
+    year: str, day_month: str
+) -> None:
+    assert find_expiration_date(f"Best before {day_month}/{year}") == []
+
+
+@pytest.mark.usefixtures("fixed_today")
+@pytest.mark.parametrize("year", ["28", "2028"])
+def test_find_expiration_date_accepts_leap_day(year: str) -> None:
+    predictions = find_expiration_date(f"Best before 29/02/{year}")
+    assert [prediction.value for prediction in predictions] == ["2028-02-29"]
+
+
+@pytest.mark.parametrize(
+    "raw,before,after",
+    [
+        ("01/01/2042", [], ["2042-01-01"]),
+        ("31/12/2021", ["2021-12-31"], []),
+    ],
+)
+def test_find_expiration_date_window_advances_with_clock(
+    mocker: MockerFixture, raw: str, before: list[str], after: list[str]
+) -> None:
+    # A long-running worker must use the new year without a module reload.
+    clock = mocker.patch(
+        "robotoff.prediction.ocr.expiration_date.datetime", wraps=datetime
+    )
+    clock.date.today.side_effect = [
+        datetime.date(2026, 12, 31),
+        datetime.date(2027, 1, 1),
+    ]
+
+    assert [prediction.value for prediction in find_expiration_date(raw)] == before
+    assert [prediction.value for prediction in find_expiration_date(raw)] == after
